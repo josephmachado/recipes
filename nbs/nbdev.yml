@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "recipes"
+  site-url: "https://josephmachado.github.io/recipes"
+  description: "personal how-tos for common DE tasks"
+  repo-branch: main
+  repo-url: "https://github.com/josephmachado/recipes"
