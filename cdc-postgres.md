@@ -2,14 +2,32 @@
 
 Demo of CDC with Postgres
 
-## Setup Postgres Tables
+## Prerequisites
 
-Create a `.sql` file to create the table to do CDC on and setup WAL blocks as well.
+1. uv 
+2. Docker 
 
-```sql
--- save this as a file cdc_pg_setup.sql
+## Setup Infrastructure
 
-DROP TABLE IF EXISTS suppliers;
+Use docker to run containers
+
+```bash
+docker stop some-postgres
+docker rm some-postgres
+docker run --name some-postgres -e POSTGRES_PASSWORD=mysecretpassword -p 5432:5432 -d postgres:16
+
+
+docker stop warehouse
+docker rm warehouse
+docker run --name warehouse -e POSTGRES_PASSWORD=mysecretpassword -p 5433:5432 -d postgres:16
+```
+
+## Setup tables 
+
+Create tables and setup publication and replication slots.
+
+```bash
+docker exec -ti some-postgres psql -U postgres -c "DROP TABLE IF EXISTS suppliers;
 CREATE TABLE suppliers (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
@@ -35,8 +53,21 @@ INSERT INTO suppliers (
     '789 Commerce Boulevard, Chicago, IL 60601, USA',
     TRUE
 );
+"
 
--- SCD2 dimension table with simplified columns
+docker exec -it some-postgres psql -U postgres -c "ALTER SYSTEM SET wal_level = logical;"
+docker restart some-postgres && sleep 5
+docker exec -it some-postgres psql -U postgres -c "ALTER ROLE postgres WITH REPLICATION;"
+docker exec -it some-postgres psql -U postgres -c "GRANT pg_read_all_data TO postgres;"
+docker exec -it some-postgres psql -U postgres -c "CREATE PUBLICATION cdc_example_publication FOR ALL TABLES;"
+docker exec -it some-postgres psql -U postgres -c "SELECT pg_create_logical_replication_slot('cdc_example_slot', 'test_decoding');"
+docker exec -it some-postgres psql -U postgres -c "SELECT pg_create_logical_replication_slot('cdc_pgoutput_slot_v2', 'pgoutput');"
+
+# Check that supplier table was created and data was inserted 
+docker exec -it some-postgres psql -U postgres -c "SELECT * FROM suppliers;"
+
+# Create a warehouse table 
+docker exec -it warehouse psql -U postgres -c "
 DROP TABLE IF EXISTS dim_suppliers;
 CREATE TABLE dim_suppliers (
     dim_supplier_key SERIAL PRIMARY KEY,
@@ -44,77 +75,122 @@ CREATE TABLE dim_suppliers (
     name VARCHAR(255) NOT NULL,
     address TEXT,
     is_active BOOLEAN DEFAULT TRUE,
-    valid_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    valid_to TIMESTAMP DEFAULT '9999-12-31 23:59:59',
-    is_current BOOLEAN DEFAULT TRUE,
-    created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    snapshot_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_ts TIMESTAMP,
+    updated_ts TIMESTAMP
 );
-
--- Logical replication setup for CDC 
-ALTER SYSTEM SET wal_level = logical;
-
-ALTER ROLE postgres WITH REPLICATION;
-GRANT pg_read_all_data TO postgres; 
-
-ALTER TABLE suppliers REPLICA IDENTITY FULL;
-
-CREATE PUBLICATION cdc_example_publication FOR ALL TABLES;
-SELECT pg_create_logical_replication_slot('cdc_example_slot', 'test_decoding');
+"
 ```
 
-Now start a postgres container with docker:
+## See WAL 
+
+Make changes to `suppliers` table and see if it shows up in the WAL files.
 
 ```bash
-docker stop some-postgres
-docker rm some-postgres
+docker exec -it some-postgres psql -U postgres -c "INSERT INTO suppliers (
+    name, 
+    address, 
+    is_active
+) VALUES 
+(
+    'Solutions Inc.',
+    'Japan',
+    TRUE
+);"
 
-# Setup postgres db with the init sql query
-docker run --name some-postgres -e POSTGRES_PASSWORD=mysecretpassword -v ./cdc_pg_setup.sql:/docker-entrypoint-initdb.d/init.sql -p 5432:5432 -d postgres:16
+docker exec -it some-postgres psql -U postgres -c "update suppliers set name = 'asia soln' where name = 'Solutions Inc.';"
+docker exec -it some-postgres psql -U postgres -c "select * from pg_logical_slot_peek_changes('cdc_example_slot', NULL, NULL, 'include-xids', '0');"
+# You will see each INSERT and UPDATE surrounded by a BEGIN -- COMMIT commands, this represents a transaction block
 ```
 
-## Check WAL
+### Script to monitor WAL 
 
-Once the postgres container is running, insert some data and query the WAL as shown below:
+We can use a Python script to monitor WAL. 
 
-```bash
-docker exec -it some-postgres psql -U postgres -d postgres # start psql cli
+```python 
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=2.13"
+# dependencies = [
+#     "psycopg2-binary",
+#     "pypgoutput",
+# ]
+# ///
+
+import psycopg2
+from psycopg2.extras import LogicalReplicationConnection
+
+# Connect to PostgreSQL - corrected connection string
+conn = psycopg2.connect("postgresql://postgres:mysecretpassword@localhost:5432/postgres" ,
+    connection_factory=LogicalReplicationConnection
+)
+cur = conn.cursor()
+
+# Start streaming changes
+cur.start_replication(slot_name='cdc_example_slot')
+
+try:
+    while True:
+        msg = cur.read_message()
+        if msg:
+            print(f"{msg}")
+            print("---")
+            cur.send_feedback(flush_lsn=msg.data_start)
+except KeyboardInterrupt:
+    print("Stopping replication...")
+finally:
+    cur.close()
+    conn.close()
 ```
 
-```sql
--- simple insert check 
--- Generate some test data
-CREATE TABLE test_wal (id int, data text);
-INSERT INTO test_wal VALUES (1, 'test data');
+## ETL Code 
 
-ALTER TABLE test_wal REPLICA IDENTITY FULL;
--- Check the WAL output
-SELECT * FROM pg_logical_slot_get_changes('cdc_example_slot', NULL, NULL);
+Simple ETL to create a snapshot table:
 
--- Once you read it will be moved from WAL to disk, so a subsequent query as below will return 0 rows, unless you CUD other tables
-SELECT * FROM pg_logical_slot_get_changes('cdc_example_slot', NULL, NULL);
+
+```python
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=2.13"
+# dependencies = [
+#     "psycopg2-binary",
+#     "pypgoutput",
+# ]
+# ///
+import psycopg2
+import pypgoutput
+
+# Connect to PostgreSQL - corrected connection string
+conn = psycopg2.connect("postgresql://postgres:mysecretpassword@localhost:5432/postgres")
+cursor = conn.cursor()
+
+# Get data from suppliers table
+cursor.execute("SELECT id, name, address, is_active, created_ts, updated_ts FROM suppliers")
+rows = cursor.fetchall()
+print("#" * 100)
+print("INPUT DATA")
+for row in rows:
+    print(row)
+print("#" * 100)
+
+cursor.close()
+conn.close()
+
+# Connect to warehouse database
+warehouse_conn = psycopg2.connect("postgresql://postgres:mysecretpassword@localhost:5433/postgres")
+warehouse_cursor = warehouse_conn.cursor()
+
+for row in rows:
+    warehouse_cursor.execute("INSERT INTO dim_suppliers (supplier_id, name, address, is_active, created_ts, updated_ts) VALUES (%s, %s, %s, %s, %s, %s)", row)
+
+warehouse_conn.commit()
+
+warehouse_cursor.execute("SELECT * FROM dim_suppliers")
+output_rows = warehouse_cursor.fetchall()
+
+print("#" * 100)
+print("OUTPUT DATA")
+for row in output_rows:
+    print(row)
+print("#" * 100)
 ```
-
-## See WAL changes with new Insert-Delete-Updates
-
-### COMMIT and ROLLBACKS
- 
-All the CUD commands are written to WAL, however there are cases where such commands may not be committed what happens in such a case?
-
-Let's update some data, but not commit it:
-
-```bash
-docker exec -it some-postgres psql -U postgres -d postgres # start psql cli
-```
-
-```sql
-Update test_wal set data = 'new test data' where id = 1; 
-
-Update test_wal set data = 'new test data 2' where id = 1; 
-
-SELECT * FROM pg_logical_slot_get_changes('cdc_example_slot', NULL, NULL);
-```
-
-psql auto commits, so the updates will show up in WAL  with BEGIN & COMMIT.
-
-**Note** Only committed transactions will show up in the WAL
